@@ -1,6 +1,6 @@
 """
 The most atomic way to train and inference a GPT LLM in pure, dependency-free Python.
-Differences from GPT-2 are minor: rmsnorm instead of layer norm, no biases, square ReLU instead of GeLU nonlinearity.
+Differences from GPT-2 are minor: rmsnorm instead of layer norm, no biases, square ReLU instead of GeLU nonlinearity, no weight tying.
 The contents of this file is everything algorithmically needed to train a GPT. Everything else is just efficiency.
 Art project by @karpathy.
 """
@@ -18,27 +18,24 @@ parser.add_argument('--block_size', type=int, default=8, help='Maximum sequence 
 parser.add_argument('--num_steps', type=int, default=1000, help='Number of training steps')
 parser.add_argument('--n_head', type=int, default=4, help='Number of attention heads in the Transformer')
 parser.add_argument('--learning_rate', type=float, default=1e-2, help='Learning rate')
-parser.add_argument('--seed', type=int, default=42, help='Random seed')
 args = parser.parse_args()
-random.seed(args.seed)
 n_embd, block_size, n_layer, n_head = args.n_embd, args.block_size, args.n_layer, args.n_head
 head_dim = n_embd // n_head
+random.seed(42)
 
 # Dataset example: the names dataset (one name per line). rest of the code just assumes docs: list[str]
 if not os.path.exists('input.txt'):
     import urllib.request
     urllib.request.urlretrieve('https://raw.githubusercontent.com/karpathy/makemore/refs/heads/master/names.txt', 'input.txt')
-with open('input.txt', 'r') as file:
-    text = file.read()
-docs = [line.strip() for line in text.strip().split('\n') if line.strip()]
+docs = [l.strip() for l in open('input.txt').read().strip().split('\n') if l.strip()] # list[str] of documents
 random.shuffle(docs)
 
-# Tokenizer: simple character-level tokenization with BOS/EOS tokens
-chars = ['<BOS>', '<EOS>'] + sorted(list(set(''.join(docs))))
+# Tokenizer: simple character-level tokenization with a BOS token delimiter
+chars = ['<BOS>'] + sorted(set(''.join(docs)))
 vocab_size = len(chars)
 stoi = { ch:i for i, ch in enumerate(chars) } # string to integer
 itos = { i:ch for i, ch in enumerate(chars) } # integer to string
-BOS, EOS = stoi['<BOS>'], stoi['<EOS>']
+BOS = stoi['<BOS>']
 print(f"vocab size: {vocab_size}, num docs: {len(docs)}")
 
 # Autograd engine
@@ -126,7 +123,7 @@ class Value:
 
 # Model parameter initialization
 matrix = lambda nout, nin, std=0.02: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd)}
+state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
@@ -134,16 +131,16 @@ for i in range(n_layer):
     state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd, std=0)
     state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd, std=0)
-params = [p for mat in state_dict.values() for row in mat for p in row]
+params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
 
 # Model architecture
 def linear(x, w):
-    return [sum(w[o][i] * x[i] for i in range(len(x))) for o in range(len(w))]
+    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
 def softmax(logits):
-    max_val = max(v.data for v in logits)
-    exps = [(v - max_val).exp() for v in logits]
+    max_val = max(val.data for val in logits)
+    exps = [(val - max_val).exp() for val in logits]
     total = sum(exps)
     return [e / total for e in exps]
 
@@ -154,8 +151,9 @@ def rmsnorm(x):
 
 def gpt(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
-    pos_emb = state_dict['wpe'][pos_id % block_size] # position embedding
+    pos_emb = state_dict['wpe'][pos_id] # position embedding
     x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
+    x = rmsnorm(x)
 
     for li in range(n_layer):
         # 1) Multi-head attention block
@@ -163,9 +161,9 @@ def gpt(token_id, pos_id, keys, values):
         x = rmsnorm(x)
         q = linear(x, state_dict[f'layer{li}.attn_wq'])
         k = linear(x, state_dict[f'layer{li}.attn_wk'])
-        val = linear(x, state_dict[f'layer{li}.attn_wv'])
+        v = linear(x, state_dict[f'layer{li}.attn_wv'])
         keys[li].append(k)
-        values[li].append(val)
+        values[li].append(v)
         x_attn = []
         for h in range(n_head):
             hs = h * head_dim
@@ -186,8 +184,7 @@ def gpt(token_id, pos_id, keys, values):
         x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
         x = [a + b for a, b in zip(x, x_residual)]
 
-    # project to vocab (weight tying with wte)
-    logits = linear(x, state_dict['wte'])
+    logits = linear(x, state_dict['lm_head'])
     return logits
 
 # Adam optimizer
@@ -197,23 +194,25 @@ m = [0.0] * len(params) # first moment
 v = [0.0] * len(params) # second moment
 
 # Training loop
+lossf_history = []
 for step in range(args.num_steps):
 
-    # Take a single training document, tokenize it, and crop to block_size
+    # Take a single training document, tokenize it, surround it with BOS special token on both sides
     doc = docs[step % len(docs)]
-    tokens = [BOS] + [stoi[ch] for ch in doc] + [EOS]
-    tokens = tokens[:block_size]
+    tokens = [BOS] + [stoi[ch] for ch in doc] + [BOS]
+    n = min(block_size, len(tokens) - 1)
 
-    # Forward pass through the document over time dimension
+    # Forward/backward through the document over time dimension
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-    lossf = 0.0
-    for pos_id in range(len(tokens) - 1):
-        logits = gpt(tokens[pos_id], pos_id, keys, values)
+    losses = []
+    for pos_id in range(n):
+        token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
+        logits = gpt(token_id, pos_id, keys, values)
         probs = softmax(logits)
-        loss = -probs[tokens[pos_id + 1]].log()
-        loss = (1 / (len(tokens) - 1)) * loss # average over sequence length
-        loss.backward()
-        lossf += loss.data
+        loss_t = -probs[target_id].log()
+        losses.append(loss_t)
+    loss = (1 / n) * sum(losses) # average loss over the sequence
+    loss.backward()
 
     # Adam update (optimizer)
     lr_t = learning_rate * (1 - step / args.num_steps)
@@ -225,19 +224,23 @@ for step in range(args.num_steps):
         p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
         p.grad = 0
 
-    print(f"step {step+1} / {args.num_steps} | loss {lossf:.4f}")
+    print(f"step {step+1} / {args.num_steps} | loss {loss.data:.4f}")
+    lossf_history.append(loss.data)
 
 # Inference: generate 5 samples
+temperature = 0.5 # number in (0, 1] that controls the "creativity" of generated text, low to high
 print("\n--- generation ---")
 for sample_idx in range(5):
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
     token_id = BOS
-    generated = []
+    print(f"sample {sample_idx}: ", end="")
     for pos_id in range(block_size):
         logits = gpt(token_id, pos_id, keys, values)
-        probs = softmax(logits)
+        probs = softmax([l / temperature for l in logits])
         token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
-        if token_id == EOS:
+        if token_id == BOS:
             break
-        generated.append(itos[token_id])
-    print(f"sample {sample_idx}: {''.join(generated)}")
+        print(itos[token_id], end="")
+    print()
+
+print(f"mean loss last 50 steps: {sum(lossf_history[-50:]) / len(lossf_history[-50:]):.4f}")
