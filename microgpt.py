@@ -181,7 +181,7 @@ for step in range(num_steps):
         p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
         p.grad = 0
 
-    print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}")
+    print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}", end='\r')
 
 # Inference: may the model babble back to us
 temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
